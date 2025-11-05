@@ -1064,13 +1064,25 @@ class ordered_hash : private Hash, private KeyEqual {
 
   iterator unordered_erase(const_iterator pos) {
     const std::size_t index_erase = iterator_to_index(pos);
-    unordered_erase(pos.key());
-
+    const auto key = pos.key();
+    
+    // Save the current state to ensure iterator validity
+    const auto old_size = m_values.size();
+    const auto result = unordered_erase(key);
+    
+    if (result == 0) {
+      // Element not found, return original position
+      return begin() + index_erase;
+    }
+    
     /*
-     * One element was deleted, index_erase now points to the next element as
-     * the elements after the deleted value were shifted to the left in m_values
-     * (will be end() if we deleted the last element).
+     * If we deleted the last element, return end()
+     * Otherwise, the index_erase now points to the element that was at old_size - 1
      */
+    if (index_erase == old_size - 1) {
+      return end();
+    }
+    
     return begin() + index_erase;
   }
 
@@ -1086,20 +1098,23 @@ class ordered_hash : private Hash, private KeyEqual {
       return 0;
     }
 
+    const std::size_t index_to_erase = it_bucket_key->index();
+    const std::size_t last_index = m_values.size() - 1;
+
     /**
      * If we are not erasing the last element in m_values, we swap
      * the element we are erasing with the last element. We then would
      * just have to do a pop_back() in m_values.
      */
-    if (!compare_keys(key, KeySelect()(back()))) {
-      auto it_bucket_last_elem =
+    if (index_to_erase != last_index) {
+      auto it_bucket_last_elem = 
           find_key(KeySelect()(back()), hash_key(KeySelect()(back())));
       tsl_oh_assert(it_bucket_last_elem != m_buckets_data.end());
-      tsl_oh_assert(it_bucket_last_elem->index() == m_values.size() - 1);
+      tsl_oh_assert(it_bucket_last_elem->index() == last_index);
 
       using std::swap;
-      swap(m_values[it_bucket_key->index()],
-           m_values[it_bucket_last_elem->index()]);
+      swap(m_values[index_to_erase], 
+           m_values[last_index]);
       swap(it_bucket_key->index_ref(), it_bucket_last_elem->index_ref());
     }
 
@@ -1247,40 +1262,63 @@ class ordered_hash : private Hash, private KeyEqual {
       return;
     }
 
-    buckets_container_type old_buckets(bucket_count);
-    m_buckets_data.swap(old_buckets);
+    // Create new buckets container with exception safety
+    buckets_container_type new_buckets;
+    try {
+      new_buckets.reserve(bucket_count);
+      new_buckets.resize(bucket_count);
+    } catch (const std::bad_alloc&) {
+      // Handle memory allocation failure - keep the current state
+      TSL_OH_THROW_OR_TERMINATE(std::bad_alloc,
+                                "Failed to allocate memory for rehash.");
+    }
+
+    // Swap buckets - this is noexcept
+    buckets_container_type old_buckets;
+    old_buckets.swap(m_buckets_data);
+    m_buckets_data.swap(new_buckets);
     m_buckets = m_buckets_data.empty() ? static_empty_bucket_ptr()
                                        : m_buckets_data.data();
-    // Everything should be noexcept from here.
 
     m_hash_mask = (bucket_count > 0) ? (bucket_count - 1) : 0;
     this->max_load_factor(m_max_load_factor);
     m_grow_on_next_insert = false;
 
-    for (const bucket_entry& old_bucket : old_buckets) {
-      if (old_bucket.empty()) {
-        continue;
-      }
-
-      truncated_hash_type insert_hash = old_bucket.truncated_hash();
-      index_type insert_index = old_bucket.index();
-
-      for (std::size_t ibucket = bucket_for_hash(insert_hash),
-                       dist_from_ideal_bucket = 0;
-           ; ibucket = next_bucket(ibucket), dist_from_ideal_bucket++) {
-        if (m_buckets[ibucket].empty()) {
-          m_buckets[ibucket].set_index(insert_index);
-          m_buckets[ibucket].set_hash(insert_hash);
-          break;
+    try {
+      for (const bucket_entry& old_bucket : old_buckets) {
+        if (old_bucket.empty()) {
+          continue;
         }
 
-        const std::size_t distance = distance_from_ideal_bucket(ibucket);
-        if (dist_from_ideal_bucket > distance) {
-          std::swap(insert_index, m_buckets[ibucket].index_ref());
-          std::swap(insert_hash, m_buckets[ibucket].truncated_hash_ref());
-          dist_from_ideal_bucket = distance;
+        truncated_hash_type insert_hash = old_bucket.truncated_hash();
+        index_type insert_index = old_bucket.index();
+
+        for (std::size_t ibucket = bucket_for_hash(insert_hash),
+                         dist_from_ideal_bucket = 0;
+             ; ibucket = next_bucket(ibucket), dist_from_ideal_bucket++) {
+          if (m_buckets[ibucket].empty()) {
+            m_buckets[ibucket].set_index(insert_index);
+            m_buckets[ibucket].set_hash(insert_hash);
+            break;
+          }
+
+          const std::size_t distance = distance_from_ideal_bucket(ibucket);
+          if (dist_from_ideal_bucket > distance) {
+            std::swap(insert_index, m_buckets[ibucket].index_ref());
+            std::swap(insert_hash, m_buckets[ibucket].truncated_hash_ref());
+            dist_from_ideal_bucket = distance;
+          }
         }
       }
+    } catch (...) {
+      // If any exception occurs during reinsertion, restore the old state
+      m_buckets_data.swap(old_buckets);
+      m_buckets = m_buckets_data.empty() ? static_empty_bucket_ptr()
+                                         : m_buckets_data.data();
+      m_hash_mask = old_buckets.empty() ? 0 : (old_buckets.size() - 1);
+      this->max_load_factor(m_max_load_factor);
+      m_grow_on_next_insert = false;
+      throw;
     }
   }
 
@@ -1399,12 +1437,26 @@ class ordered_hash : private Hash, private KeyEqual {
       dist_from_ideal_bucket = 0;
     }
 
-    m_values.emplace_back(std::forward<Args>(value_type_args)...);
-    insert_index(ibucket, dist_from_ideal_bucket,
-                 index_type(m_values.size() - 1),
-                 bucket_entry::truncate_hash(hash));
+    // Use exception-safe insertion: first construct in place, then update buckets
+    const std::size_t old_size = m_values.size();
+    try {
+      m_values.emplace_back(std::forward<Args>(value_type_args)...);
+    } catch (...) {
+      // If emplace_back fails, no changes are made to the buckets
+      throw;
+    }
 
-    return std::make_pair(std::prev(end()), true);
+    try {
+      insert_index(ibucket, dist_from_ideal_bucket,
+                   index_type(old_size),
+                   bucket_entry::truncate_hash(hash));
+    } catch (...) {
+      // If insert_index fails, remove the element from m_values
+      m_values.pop_back();
+      throw;
+    }
+
+    return std::make_pair(begin() + old_size, true);
   }
 
   /**
@@ -1442,27 +1494,48 @@ class ordered_hash : private Hash, private KeyEqual {
       dist_from_ideal_bucket = 0;
     }
 
-    const index_type index_insert_position =
+    const index_type index_insert_position = 
         index_type(std::distance(m_values.cbegin(), insert_position));
 
+    // Use exception-safe insertion: first construct in place, then update buckets
+    const std::size_t old_size = m_values.size();
+    bool inserted_at_end = (index_insert_position == old_size);
+    
+    try {
 #ifdef TSL_OH_NO_CONTAINER_EMPLACE_CONST_ITERATOR
-    m_values.emplace(
-        m_values.begin() + std::distance(m_values.cbegin(), insert_position),
-        std::forward<Args>(value_type_args)...);
+      m_values.emplace(
+          m_values.begin() + std::distance(m_values.cbegin(), insert_position),
+          std::forward<Args>(value_type_args)...);
 #else
-    m_values.emplace(insert_position, std::forward<Args>(value_type_args)...);
+      m_values.emplace(insert_position, std::forward<Args>(value_type_args)...);
 #endif
-
-    /*
-     * The insertion didn't happend at the end of the m_values container,
-     * we need to shift the indexes in m_buckets_data.
-     */
-    if (index_insert_position != m_values.size() - 1) {
-      shift_indexes_in_buckets(index_insert_position, 1);
+    } catch (...) {
+      // If emplace fails, no changes are made to the buckets
+      throw;
     }
 
-    insert_index(ibucket, dist_from_ideal_bucket, index_insert_position,
-                 bucket_entry::truncate_hash(hash));
+    try {
+      /*
+       * The insertion didn't happen at the end of the m_values container,
+       * we need to shift the indexes in m_buckets_data.
+       */
+      if (!inserted_at_end) {
+        shift_indexes_in_buckets(index_insert_position, 1);
+      }
+
+      insert_index(ibucket, dist_from_ideal_bucket, index_insert_position,
+                   bucket_entry::truncate_hash(hash));
+    } catch (...) {
+      // If any subsequent operation fails, remove the element from m_values
+      m_values.erase(m_values.begin() + index_insert_position);
+      
+      // If we shifted indexes, shift them back
+      if (!inserted_at_end) {
+        shift_indexes_in_buckets(index_insert_position, -1);
+      }
+      
+      throw;
+    }
 
     return std::make_pair(iterator(m_values.begin() + index_insert_position),
                           true);
@@ -1569,59 +1642,89 @@ class ordered_hash : private Hash, private KeyEqual {
   void deserialize_impl(Deserializer& deserializer, bool hash_compatible) {
     tsl_oh_assert(m_buckets_data.empty());  // Current hash table must be empty
 
-    const slz_size_type version =
-        deserialize_value<slz_size_type>(deserializer);
-    // For now we only have one version of the serialization protocol.
-    // If it doesn't match there is a problem with the file.
-    if (version != SERIALIZATION_PROTOCOL_VERSION) {
-      TSL_OH_THROW_OR_TERMINATE(std::runtime_error,
-                                "Can't deserialize the ordered_map/set. "
-                                "The protocol version header is invalid.");
-    }
+    // Save initial state for rollback in case of failure
+    const auto initial_buckets_data = m_buckets_data;
+    const auto initial_buckets = m_buckets;
+    const auto initial_hash_mask = m_hash_mask;
+    const auto initial_values = m_values;
+    const auto initial_load_threshold = m_load_threshold;
+    const auto initial_max_load_factor = m_max_load_factor;
+    const auto initial_grow_on_next_insert = m_grow_on_next_insert;
 
-    const slz_size_type nb_elements =
-        deserialize_value<slz_size_type>(deserializer);
-    const slz_size_type bucket_count_ds =
-        deserialize_value<slz_size_type>(deserializer);
-    const float max_load_factor = deserialize_value<float>(deserializer);
-
-    if (max_load_factor < MAX_LOAD_FACTOR__MINIMUM ||
-        max_load_factor > MAX_LOAD_FACTOR__MAXIMUM) {
-      TSL_OH_THROW_OR_TERMINATE(
-          std::runtime_error,
-          "Invalid max_load_factor. Check that the serializer "
-          "and deserializer support floats correctly as they "
-          "can be converted implicitly to ints.");
-    }
-
-    this->max_load_factor(max_load_factor);
-
-    if (bucket_count_ds == 0) {
-      tsl_oh_assert(nb_elements == 0);
-      return;
-    }
-
-    if (!hash_compatible) {
-      reserve(numeric_cast<size_type>(nb_elements,
-                                      "Deserialized nb_elements is too big."));
-      for (slz_size_type el = 0; el < nb_elements; el++) {
-        insert(deserialize_value<value_type>(deserializer));
-      }
-    } else {
-      m_buckets_data.reserve(numeric_cast<size_type>(
-          bucket_count_ds, "Deserialized bucket_count is too big."));
-      m_buckets = m_buckets_data.data(),
-      m_hash_mask = m_buckets_data.capacity() - 1;
-
-      reserve_space_for_values(numeric_cast<size_type>(
-          nb_elements, "Deserialized nb_elements is too big."));
-      for (slz_size_type el = 0; el < nb_elements; el++) {
-        m_values.push_back(deserialize_value<value_type>(deserializer));
+    try {
+      const slz_size_type version = 
+          deserialize_value<slz_size_type>(deserializer);
+      // For now we only have one version of the serialization protocol.
+      // If it doesn't match there is a problem with the file.
+      if (version != SERIALIZATION_PROTOCOL_VERSION) {
+        TSL_OH_THROW_OR_TERMINATE(std::runtime_error,
+                                  "Can't deserialize the ordered_map/set. "
+                                  "The protocol version header is invalid. Version: " + std::to_string(version));
       }
 
-      for (slz_size_type b = 0; b < bucket_count_ds; b++) {
-        m_buckets_data.push_back(bucket_entry::deserialize(deserializer));
+      const slz_size_type nb_elements = 
+          deserialize_value<slz_size_type>(deserializer);
+      const slz_size_type bucket_count_ds = 
+          deserialize_value<slz_size_type>(deserializer);
+      const float max_load_factor = deserialize_value<float>(deserializer);
+
+      if (max_load_factor < MAX_LOAD_FACTOR__MINIMUM ||
+          max_load_factor > MAX_LOAD_FACTOR__MAXIMUM) {
+        TSL_OH_THROW_OR_TERMINATE(
+            std::runtime_error,
+            "Invalid max_load_factor: " + std::to_string(max_load_factor) + 
+            ". Must be between " + std::to_string(MAX_LOAD_FACTOR__MINIMUM) + 
+            " and " + std::to_string(MAX_LOAD_FACTOR__MAXIMUM) + ".");
       }
+
+      this->max_load_factor(max_load_factor);
+
+      if (bucket_count_ds == 0) {
+        if (nb_elements != 0) {
+          TSL_OH_THROW_OR_TERMINATE(std::runtime_error,
+                                    "Invalid deserialization data: bucket_count is 0 but nb_elements is not 0.");
+        }
+        return;
+      }
+
+      if (!hash_compatible) {
+        reserve(numeric_cast<size_type>(nb_elements,
+                                        "Deserialized nb_elements is too big."));
+        for (slz_size_type el = 0; el < nb_elements; el++) {
+          insert(deserialize_value<value_type>(deserializer));
+        }
+      } else {
+        m_buckets_data.reserve(numeric_cast<size_type>(
+            bucket_count_ds, "Deserialized bucket_count is too big."));
+        m_buckets = m_buckets_data.data(),
+        m_hash_mask = m_buckets_data.capacity() - 1;
+
+        reserve_space_for_values(numeric_cast<size_type>(
+            nb_elements, "Deserialized nb_elements is too big."));
+        for (slz_size_type el = 0; el < nb_elements; el++) {
+          m_values.push_back(deserialize_value<value_type>(deserializer));
+        }
+
+        for (slz_size_type b = 0; b < bucket_count_ds; b++) {
+          const auto bucket = bucket_entry::deserialize(deserializer);
+          if (!bucket.empty() && bucket.index() >= nb_elements) {
+            TSL_OH_THROW_OR_TERMINATE(std::runtime_error,
+                                      "Invalid bucket index: " + std::to_string(bucket.index()) + 
+                                      ". Must be less than nb_elements: " + std::to_string(nb_elements) + ".");
+          }
+          m_buckets_data.push_back(bucket);
+        }
+      }
+    } catch (...) {
+      // Rollback to initial state on failure
+      m_buckets_data = initial_buckets_data;
+      m_buckets = initial_buckets;
+      m_hash_mask = initial_hash_mask;
+      m_values = initial_values;
+      m_load_threshold = initial_load_threshold;
+      m_max_load_factor = initial_max_load_factor;
+      m_grow_on_next_insert = initial_grow_on_next_insert;
+      throw;
     }
   }
 
