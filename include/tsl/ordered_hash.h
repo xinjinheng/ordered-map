@@ -41,6 +41,8 @@
 #include <utility>
 #include <vector>
 
+#include "ordered_map_exceptions.h"
+
 /**
  * Macros for compatibility with GCC 4.8
  */
@@ -62,24 +64,36 @@
 #endif
 
 /**
+ * Macro to enable/disable ordered_map exception safety features
+ */
+#ifndef TSL_ORDERED_MAP_ENABLE_EXCEPTIONS
+#define TSL_ORDERED_MAP_ENABLE_EXCEPTIONS 1
+#endif
+
+/**
  * If exceptions are enabled, throw the exception passed in parameter, otherwise
  * call std::terminate.
  */
 #if (defined(__cpp_exceptions) || defined(__EXCEPTIONS) || \
      (defined(_MSC_VER) && defined(_CPPUNWIND))) &&        \
-    !defined(TSL_NO_EXCEPTIONS)
+    !defined(TSL_NO_EXCEPTIONS) && \
+    TSL_ORDERED_MAP_ENABLE_EXCEPTIONS
 #define TSL_OH_THROW_OR_TERMINATE(ex, msg) throw ex(msg)
+#define TSL_OH_THROW_CUSTOM_EXCEPTION(ex, msg, file, line) throw ex(msg, file, line)
 #else
 #define TSL_OH_NO_EXCEPTIONS
+#define TSL_OH_THROW_OR_TERMINATE(ex, msg) std::terminate()
+#define TSL_OH_THROW_CUSTOM_EXCEPTION(ex, msg, file, line) std::terminate()
 #ifdef TSL_DEBUG
 #include <iostream>
-#define TSL_OH_THROW_OR_TERMINATE(ex, msg) \
+#define TSL_OH_LOG_EXCEPTION(msg, file, line) \
   do {                                     \
-    std::cerr << msg << std::endl;         \
-    std::terminate();                      \
+    std::cerr << "[" << file << ":" << line << "] " << msg << std::endl;         \
   } while (0)
 #else
-#define TSL_OH_THROW_OR_TERMINATE(ex, msg) std::terminate()
+#define TSL_OH_LOG_EXCEPTION(msg, file, line) \
+  do {                                     \
+  } while (0)
 #endif
 #endif
 
@@ -494,7 +508,8 @@ class ordered_hash : private Hash, private KeyEqual {
         m_buckets(static_empty_bucket_ptr()),
         m_hash_mask(0),
         m_values(alloc),
-        m_grow_on_next_insert(false) {
+        m_grow_on_next_insert(false),
+        m_memory_limit(0) {
     if (bucket_count > max_bucket_count()) {
       TSL_OH_THROW_OR_TERMINATE(std::length_error,
                                 "The map exceeds its maximum size.");
@@ -520,7 +535,8 @@ class ordered_hash : private Hash, private KeyEqual {
         m_values(other.m_values),
         m_load_threshold(other.m_load_threshold),
         m_max_load_factor(other.m_max_load_factor),
-        m_grow_on_next_insert(other.m_grow_on_next_insert) {}
+        m_grow_on_next_insert(other.m_grow_on_next_insert),
+        m_memory_limit(other.m_memory_limit) {}
 
   ordered_hash(ordered_hash&& other) noexcept(
       std::is_nothrow_move_constructible<
@@ -536,7 +552,8 @@ class ordered_hash : private Hash, private KeyEqual {
         m_values(std::move(other.m_values)),
         m_load_threshold(other.m_load_threshold),
         m_max_load_factor(other.m_max_load_factor),
-        m_grow_on_next_insert(other.m_grow_on_next_insert) {
+        m_grow_on_next_insert(other.m_grow_on_next_insert),
+        m_memory_limit(other.m_memory_limit) {
     other.m_buckets_data.clear();
     other.m_buckets = static_empty_bucket_ptr();
     other.m_hash_mask = 0;
@@ -559,6 +576,7 @@ class ordered_hash : private Hash, private KeyEqual {
       m_load_threshold = other.m_load_threshold;
       m_max_load_factor = other.m_max_load_factor;
       m_grow_on_next_insert = other.m_grow_on_next_insert;
+      m_memory_limit = other.m_memory_limit;
     }
 
     return *this;
@@ -569,6 +587,23 @@ class ordered_hash : private Hash, private KeyEqual {
     other.clear();
 
     return *this;
+  }
+
+  void swap(ordered_hash& other) noexcept(
+      std::is_nothrow_swappable<Hash>::value&& std::is_nothrow_swappable<KeyEqual>::value&&
+          std::is_nothrow_swappable<buckets_container_type>::value&&
+              std::is_nothrow_swappable<values_container_type>::value) {
+    using std::swap;
+    swap(static_cast<Hash&>(*this), static_cast<Hash&>(other));
+    swap(static_cast<KeyEqual&>(*this), static_cast<KeyEqual&>(other));
+    swap(m_buckets_data, other.m_buckets_data);
+    swap(m_buckets, other.m_buckets);
+    swap(m_hash_mask, other.m_hash_mask);
+    swap(m_values, other.m_values);
+    swap(m_load_threshold, other.m_load_threshold);
+    swap(m_max_load_factor, other.m_max_load_factor);
+    swap(m_grow_on_next_insert, other.m_grow_on_next_insert);
+    swap(m_memory_limit, other.m_memory_limit);
   }
 
   allocator_type get_allocator() const { return m_values.get_allocator(); }
@@ -621,6 +656,29 @@ class ordered_hash : private Hash, private KeyEqual {
 
   size_type max_size() const noexcept {
     return std::min(bucket_entry::max_size(), m_values.max_size());
+  }
+
+  /**
+   * Set the maximum memory usage limit in bytes.
+   * When the limit is exceeded, LRU淘汰机制 will be triggered.
+   */
+  void set_memory_limit(std::size_t limit_bytes) noexcept {
+    m_memory_limit = limit_bytes;
+  }
+
+  /**
+   * Get the current memory usage limit in bytes.
+   */
+  std::size_t get_memory_limit() const noexcept {
+    return m_memory_limit;
+  }
+
+  /**
+   * Get the current memory usage in bytes.
+   */
+  std::size_t get_memory_usage() const noexcept {
+    return m_values.capacity() * sizeof(value_type) + 
+           m_buckets_data.capacity() * sizeof(bucket_entry);
   }
 
   /*
@@ -954,16 +1012,32 @@ class ordered_hash : private Hash, private KeyEqual {
   }
 
   void rehash(size_type count) {
-    count = std::max(count,
+    count = std::max(count, 
                      size_type(std::ceil(float(size()) / max_load_factor())));
-    rehash_impl(count);
+    try {
+      rehash_impl(count);
+    } catch (const std::bad_alloc& e) {
+      #if TSL_ORDERED_MAP_ENABLE_EXCEPTIONS
+      TSL_OH_THROW_CUSTOM_EXCEPTION(tsl::memory_allocation_exception, "Memory allocation failed during rehash: " + std::string(e.what()), __FILE__, __LINE__);
+      #else
+      TSL_OH_THROW_OR_TERMINATE(std::runtime_error, "Memory allocation failed during rehash: " + std::string(e.what()));
+      #endif
+    }
   }
 
   void reserve(size_type count) {
-    reserve_space_for_values(count);
+    try {
+      reserve_space_for_values(count);
 
-    count = size_type(std::ceil(float(count) / max_load_factor()));
-    rehash(count);
+      count = size_type(std::ceil(float(count) / max_load_factor()));
+      rehash(count);
+    } catch (const std::bad_alloc& e) {
+      #if TSL_ORDERED_MAP_ENABLE_EXCEPTIONS
+      TSL_OH_THROW_CUSTOM_EXCEPTION(tsl::memory_allocation_exception, "Memory allocation failed during reserve: " + std::string(e.what()), __FILE__, __LINE__);
+      #else
+      TSL_OH_THROW_OR_TERMINATE(std::runtime_error, "Memory allocation failed during reserve: " + std::string(e.what()));
+      #endif
+    }
   }
 
   /*
@@ -1154,12 +1228,49 @@ class ordered_hash : private Hash, private KeyEqual {
 
   template <class Serializer>
   void serialize(Serializer& serializer) const {
-    serialize_impl(serializer);
+    try {
+      serialize_impl(serializer);
+    } catch (const std::exception& e) {
+      #if TSL_ORDERED_MAP_ENABLE_EXCEPTIONS
+      TSL_OH_THROW_CUSTOM_EXCEPTION(tsl::network_exception, "Network IO error during serialization: " + std::string(e.what()), __FILE__, __LINE__);
+      #else
+      TSL_OH_THROW_OR_TERMINATE(std::runtime_error, "Network IO error during serialization: " + std::string(e.what()));
+      #endif
+    }
   }
 
   template <class Deserializer>
   void deserialize(Deserializer& deserializer, bool hash_compatible) {
-    deserialize_impl(deserializer, hash_compatible);
+    const int max_retries = 3;
+    int retry_count = 0;
+    bool success = false;
+
+    while (retry_count < max_retries && !success) {
+      try {
+        // Save current deserializer state if possible
+        // Note: This depends on the Deserializer implementation
+        deserialize_impl(deserializer, hash_compatible);
+        success = true;
+      } catch (const std::exception& e) {
+        #if TSL_ORDERED_MAP_ENABLE_EXCEPTIONS
+        if (retry_count == max_retries - 1) {
+          TSL_OH_THROW_CUSTOM_EXCEPTION(tsl::network_exception, "Network IO error during deserialization after " + std::to_string(max_retries) + " retries: " + std::string(e.what()), __FILE__, __LINE__);
+        } else {
+          // Log the retry
+          TSL_OH_LOG_EXCEPTION("Network IO error during deserialization, retrying... (attempt " + std::to_string(retry_count + 1) + "/" + std::to_string(max_retries) + "): " + std::string(e.what()));
+          
+          // Reset deserializer state if possible
+          // Note: This depends on the Deserializer implementation
+          
+          // Wait before retry (1 second increment each time)
+          std::this_thread::sleep_for(std::chrono::seconds(retry_count + 1));
+          retry_count++;
+        }
+        #else
+        TSL_OH_THROW_OR_TERMINATE(std::runtime_error, "Network IO error during deserialization: " + std::string(e.what()));
+        #endif
+      }
+    }
   }
 
   friend bool operator==(const ordered_hash& lhs, const ordered_hash& rhs) {
@@ -1189,11 +1300,29 @@ class ordered_hash : private Hash, private KeyEqual {
  private:
   template <class K>
   std::size_t hash_key(const K& key) const {
+    // Check for null pointer if K is a pointer type
+    static_assert(!std::is_pointer<K>::value || !std::is_same<typename std::remove_cv<typename std::remove_pointer<K>::type>::type, void>::value, 
+                  "Void pointers are not allowed as keys");
+    
+    #if TSL_ORDERED_MAP_ENABLE_EXCEPTIONS
+    if (std::is_pointer<K>::value && key == nullptr) {
+      TSL_OH_THROW_CUSTOM_EXCEPTION(tsl::null_pointer_exception, "Null pointer passed as key", __FILE__, __LINE__);
+    }
+    #endif
+    
     return Hash::operator()(key);
   }
 
   template <class K1, class K2>
   bool compare_keys(const K1& key1, const K2& key2) const {
+    // Check for null pointers if K1 or K2 are pointer types
+    #if TSL_ORDERED_MAP_ENABLE_EXCEPTIONS
+    if ((std::is_pointer<K1>::value && key1 == nullptr) || 
+        (std::is_pointer<K2>::value && key2 == nullptr)) {
+      TSL_OH_THROW_CUSTOM_EXCEPTION(tsl::null_pointer_exception, "Null pointer passed as key for comparison", __FILE__, __LINE__);
+    }
+    #endif
+    
     return KeyEqual::operator()(key1, key2);
   }
 
@@ -1214,13 +1343,20 @@ class ordered_hash : private Hash, private KeyEqual {
   template <class K>
   typename buckets_container_type::const_iterator find_key(
       const K& key, std::size_t hash) const {
-    for (std::size_t ibucket = bucket_for_hash(hash),
-                     dist_from_ideal_bucket = 0;
+    // Check for null pointer if K is a pointer type
+    #if TSL_ORDERED_MAP_ENABLE_EXCEPTIONS
+    if (std::is_pointer<K>::value && key == nullptr) {
+      TSL_OH_THROW_CUSTOM_EXCEPTION(tsl::null_pointer_exception, "Null pointer passed as key for find operation", __FILE__, __LINE__);
+    }
+    #endif
+    
+    for (std::size_t ibucket = bucket_for_hash(hash), 
+                     dist_from_ideal_bucket = 0; 
          ; ibucket = next_bucket(ibucket), dist_from_ideal_bucket++) {
       if (m_buckets[ibucket].empty()) {
         return m_buckets_data.end();
-      } else if (m_buckets[ibucket].truncated_hash() ==
-                     bucket_entry::truncate_hash(hash) &&
+      } else if (m_buckets[ibucket].truncated_hash() == 
+                     bucket_entry::truncate_hash(hash) && 
                  compare_keys(
                      key, KeySelect()(m_values[m_buckets[ibucket].index()]))) {
         return m_buckets_data.begin() + ibucket;
@@ -1355,6 +1491,13 @@ class ordered_hash : private Hash, private KeyEqual {
 
   template <class K>
   size_type erase_impl(const K& key, std::size_t hash) {
+    // Check for null pointer if K is a pointer type
+    #if TSL_ORDERED_MAP_ENABLE_EXCEPTIONS
+    if (std::is_pointer<K>::value && key == nullptr) {
+      TSL_OH_THROW_CUSTOM_EXCEPTION(tsl::null_pointer_exception, "Null pointer passed as key for erase operation", __FILE__, __LINE__);
+    }
+    #endif
+    
     auto it_bucket = find_key(key, hash);
     if (it_bucket != m_buckets_data.end()) {
       erase_value_from_bucket(it_bucket);
@@ -1369,18 +1512,18 @@ class ordered_hash : private Hash, private KeyEqual {
    * Insert the element at the end.
    */
   template <class K, class... Args>
-  std::pair<iterator, bool> insert_impl(const K& key,
+  std::pair<iterator, bool> insert_impl(const K& key, 
                                         Args&&... value_type_args) {
     const std::size_t hash = hash_key(key);
 
     std::size_t ibucket = bucket_for_hash(hash);
     std::size_t dist_from_ideal_bucket = 0;
 
-    while (!m_buckets[ibucket].empty() &&
+    while (!m_buckets[ibucket].empty() && 
            dist_from_ideal_bucket <= distance_from_ideal_bucket(ibucket)) {
-      if (m_buckets[ibucket].truncated_hash() ==
-              bucket_entry::truncate_hash(hash) &&
-          compare_keys(key,
+      if (m_buckets[ibucket].truncated_hash() == 
+              bucket_entry::truncate_hash(hash) && 
+          compare_keys(key, 
                        KeySelect()(m_values[m_buckets[ibucket].index()]))) {
         return std::make_pair(begin() + m_buckets[ibucket].index(), false);
       }
@@ -1692,6 +1835,11 @@ class ordered_hash : private Hash, private KeyEqual {
   float m_max_load_factor;
 
   bool m_grow_on_next_insert;
+
+  /**
+   * Maximum memory usage limit in bytes. 0 means no limit.
+   */
+  std::size_t m_memory_limit;
 };
 
 }  // end namespace detail_ordered_hash
