@@ -1,0 +1,141 @@
+cmake_minimum_required(VERSION 3.10)
+project(ordered_map_exceptions)
+
+# 设置C++标准
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# 编译选项
+if(MSVC)
+    add_compile_options(/W4 /WX)
+else()
+    add_compile_options(-Wall -Wextra -Wpedantic -Werror)
+endif()
+
+# 启用异常（默认启用）
+option(TSL_ORDERED_MAP_ENABLE_EXCEPTIONS "Enable exception safety features" ON)
+if(TSL_ORDERED_MAP_ENABLE_EXCEPTIONS)
+    add_definitions(-DTSL_ORDERED_MAP_ENABLE_EXCEPTIONS=1)
+else()
+    add_definitions(-DTSL_ORDERED_MAP_ENABLE_EXCEPTIONS=0)
+endif()
+
+# 启用线程安全（默认启用）
+option(TSL_ORDERED_MAP_ENABLE_THREAD_SAFETY "Enable thread safety features" ON)
+if(TSL_ORDERED_MAP_ENABLE_THREAD_SAFETY)
+    add_definitions(-DTSL_ORDERED_MAP_ENABLE_THREAD_SAFETY=1)
+else()
+    add_definitions(-DTSL_ORDERED_MAP_ENABLE_THREAD_SAFETY=0)
+endif()
+
+# 启用内存管理（默认启用）
+option(TSL_ORDERED_MAP_ENABLE_MEMORY_MANAGEMENT "Enable memory management features" ON)
+if(TSL_ORDERED_MAP_ENABLE_MEMORY_MANAGEMENT)
+    add_definitions(-DTSL_ORDERED_MAP_ENABLE_MEMORY_MANAGEMENT=1)
+else()
+    add_definitions(-DTSL_ORDERED_MAP_ENABLE_MEMORY_MANAGEMENT=0)
+endif()
+
+# 启用网络安全（默认启用）
+option(TSL_ORDERED_MAP_ENABLE_NETWORK_SAFETY "Enable network safety features" ON)
+if(TSL_ORDERED_MAP_ENABLE_NETWORK_SAFETY)
+    add_definitions(-DTSL_ORDERED_MAP_ENABLE_NETWORK_SAFETY=1)
+else()
+    add_definitions(-DTSL_ORDERED_MAP_ENABLE_NETWORK_SAFETY=0)
+endif()
+
+# 包含头文件目录
+include_directories(include)
+
+# 查找GTest（用于测试）
+find_package(GTest QUIET)
+if(GTest_FOUND)
+    message(STATUS "Found GTest: ${GTest_VERSION}")
+else()
+    message(STATUS "GTest not found, will build tests only if GTest is available")
+endif()
+
+# 示例程序
+add_executable(ordered_map_example
+    example/ordered_map_example.cpp
+)
+
+# 链接线程库（如果需要）
+if(TSL_ORDERED_MAP_ENABLE_THREAD_SAFETY)
+    find_package(Threads REQUIRED)
+    target_link_libraries(ordered_map_example Threads::Threads)
+endif()
+
+# 测试程序
+if(GTest_FOUND)
+    add_executable(ordered_map_exception_tests
+        test/ordered_map_exception_tests.cpp
+    )
+    
+    target_link_libraries(ordered_map_exception_tests
+        GTest::GTest
+        GTest::Main
+    )
+    
+    if(TSL_ORDERED_MAP_ENABLE_THREAD_SAFETY)
+        target_link_libraries(ordered_map_exception_tests Threads::Threads)
+    endif()
+    
+    # 注册测试
+    include(GoogleTest)
+    gtest_discover_tests(ordered_map_exception_tests)
+endif()
+
+# 安装目标
+install(TARGETS ordered_map_example
+    RUNTIME DESTINATION bin
+)
+
+if(GTest_FOUND)
+    install(TARGETS ordered_map_exception_tests
+        RUNTIME DESTINATION bin
+    )
+endif()
+
+# 安装头文件
+install(DIRECTORY include/tsl
+    DESTINATION include
+    FILES_MATCHING PATTERN "*.h"
+)
+
+# 构建文档（可选）
+option(BUILD_DOCUMENTATION "Build documentation" OFF)
+if(BUILD_DOCUMENTATION)
+    find_package(Doxygen)
+    if(DOXYGEN_FOUND)
+        set(DOXYGEN_IN ${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile.in)
+        set(DOXYGEN_OUT ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile)
+        
+        configure_file(${DOXYGEN_IN} ${DOXYGEN_OUT} @ONLY)
+        
+        add_custom_target(doc_doxygen ALL
+            COMMAND ${DOXYGEN_EXECUTABLE} ${DOXYGEN_OUT}
+            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+            COMMENT "Generating API documentation with Doxygen"
+            VERBATIM
+        )
+        
+        install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/docs/html
+            DESTINATION share/doc/ordered_map_exceptions
+        )
+    else()
+        message(WARNING "Doxygen not found, cannot build documentation")
+    endif()
+endif()
+
+# 打印配置信息
+message(STATUS "")
+message(STATUS "ordered_map_exceptions configuration:")
+message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
+message(STATUS "  Enable Exceptions: ${TSL_ORDERED_MAP_ENABLE_EXCEPTIONS}")
+message(STATUS "  Enable Thread Safety: ${TSL_ORDERED_MAP_ENABLE_THREAD_SAFETY}")
+message(STATUS "  Enable Memory Management: ${TSL_ORDERED_MAP_ENABLE_MEMORY_MANAGEMENT}")
+message(STATUS "  Enable Network Safety: ${TSL_ORDERED_MAP_ENABLE_NETWORK_SAFETY}")
+message(STATUS "  Build Documentation: ${BUILD_DOCUMENTATION}")
+message(STATUS "")
