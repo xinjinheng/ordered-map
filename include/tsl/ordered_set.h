@@ -207,6 +207,28 @@ class ordered_set {
   size_type size() const noexcept { return m_ht.size(); }
   size_type max_size() const noexcept { return m_ht.max_size(); }
 
+  /**
+   * Set the maximum memory usage limit in bytes.
+   * When the limit is exceeded, LRU淘汰机制 will be triggered.
+   */
+  void set_memory_limit(std::size_t limit_bytes) noexcept {
+    m_ht.set_memory_limit(limit_bytes);
+  }
+
+  /**
+   * Get the current memory usage limit in bytes.
+   */
+  std::size_t get_memory_limit() const noexcept {
+    return m_ht.get_memory_limit();
+  }
+
+  /**
+   * Get the current memory usage in bytes.
+   */
+  std::size_t get_memory_usage() const noexcept {
+    return m_ht.get_memory_usage();
+  }
+
   /*
    * Modifiers
    */
